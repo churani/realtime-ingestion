@@ -40,6 +40,11 @@ impl DedupChecker {
     ///   - `Ok(false)` : 중복 이벤트 — 버려야 한다
     ///   - `Err(_)`    : Redis 통신 실패
     pub async fn is_new(&self, event_id: &str) -> Result<bool> {
+        // 방어적 길이 검증 — 호출자가 먼저 검증하더라도 Redis 키 크기 보장
+        if event_id.is_empty() || event_id.len() > 512 {
+            anyhow::bail!("event_id 길이 범위 초과: {}자 (1–512 허용)", event_id.len());
+        }
+
         // clone()은 Arc 참조 카운트 증가뿐 — 연결 복사가 아님
         let mut conn = self.manager.clone();
 

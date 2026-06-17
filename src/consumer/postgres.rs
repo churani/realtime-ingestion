@@ -45,10 +45,17 @@ pub async fn run(
     let prefetch = ((batch_size * 2) as u16).max(50);
     channel.basic_qos(prefetch, BasicQosOptions { global: false }).await?;
 
+    let consumer_tag = format!(
+        "postgres-consumer-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
     let mut consumer = channel
         .basic_consume(
             queue_name,
-            "postgres-consumer",
+            &consumer_tag,
             BasicConsumeOptions::default(),
             FieldTable::default(),
         )
@@ -81,9 +88,7 @@ pub async fn run(
                     Some(Err(e)) => {
                         tracing::error!(error = ?e, "PostgreSQL 소비자 채널 오류");
                         if let Some(n) = &notifier {
-                            n.notify(&format!(
-                                "🔴 <b>[PostgreSQL 소비자]</b> 채널 오류\n<code>{e}</code>"
-                            )).await;
+                            n.notify("🔴 <b>[PostgreSQL 소비자]</b> 채널 오류 — 재시작 예정").await;
                         }
                         return Err(e.into());
                     }
@@ -175,8 +180,14 @@ async fn flush(
         Err(e) => {
             tracing::error!(error = ?e, count, "PostgreSQL 배치 INSERT 실패, 재큐잉");
             if let Some(n) = notifier {
+                let err_code = match &e {
+                    sqlx::Error::Database(db) => format!("DB-{}", db.code().as_deref().unwrap_or("?")),
+                    sqlx::Error::PoolTimedOut => "pool_timeout".to_string(),
+                    sqlx::Error::PoolClosed   => "pool_closed".to_string(),
+                    _ => "query_error".to_string(),
+                };
                 n.notify(&format!(
-                    "⚠️ <b>[PostgreSQL 소비자]</b> 배치 INSERT 실패 ({count}건)\n<code>{e}</code>"
+                    "⚠️ <b>[PostgreSQL 소비자]</b> 배치 INSERT 실패 ({count}건) — {err_code}"
                 )).await;
             }
             for d in deliveries.drain(..) {

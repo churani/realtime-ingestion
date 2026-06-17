@@ -39,10 +39,50 @@ pub struct AppState {
 /// 202 Accepted를 쓰는 이유:
 ///   DB 저장은 소비자가 비동기로 처리하므로 "받았고 처리 예정"을 나타내는
 ///   202가 200보다 의미상 정확하다.
+/// id/event_type 필드를 검증한다.
+///
+/// id: 1–128자, ASCII 영숫자·하이픈·언더스코어만 허용
+/// event_type: 1–64자
+fn validate_event(event: &IncomingEvent) -> Option<(StatusCode, Json<ApiResponse>)> {
+    if event.id.is_empty() || event.id.len() > 128 {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse {
+                status: "error",
+                message: "id must be 1–128 characters".into(),
+            }),
+        ));
+    }
+    if !event.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse {
+                status: "error",
+                message: "id contains invalid characters (allowed: a-z A-Z 0-9 - _)".into(),
+            }),
+        ));
+    }
+    if event.event_type.is_empty() || event.event_type.len() > 64 {
+        return Some((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse {
+                status: "error",
+                message: "event_type must be 1–64 characters".into(),
+            }),
+        ));
+    }
+    None
+}
+
 pub async fn handle_event(
     State(state): State<Arc<AppState>>,
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
+    // ── Step 0: 입력 검증 ─────────────────────────────────────────────
+    if let Some(err) = validate_event(&event) {
+        return err;
+    }
+
     // ── Step 1: 중복 체크 ──────────────────────────────────────────────
     let is_new = match state.dedup.is_new(&event.id).await {
         Ok(v) => v,

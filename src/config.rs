@@ -72,8 +72,8 @@ pub struct Config {
 
     // ── 보안 설정 ────────────────────────────────────────────────────────────
 
-    /// HTTP API 키 (X-API-Key 헤더). None이면 인증 비활성화.
-    pub api_key: Option<String>,
+    /// HTTP API 키 (X-API-Key 헤더). 필수값 — 미설정 시 서버 시작 거부.
+    pub api_key: String,
 
     /// IP당 HTTP 초당 최대 요청 수 (rate limiting)
     pub http_rate_per_second: u32,
@@ -170,7 +170,7 @@ impl Config {
                 .or_else(|_| std::env::var("TELE_CHATID")).ok(),
 
             tcp_addr: std::env::var("TCP_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:38701".to_string()),
+                .unwrap_or_else(|_| "127.0.0.1:38701".to_string()),
 
             allowed_ips: std::env::var("ALLOWED_IPS")
                 .unwrap_or_default()
@@ -198,15 +198,18 @@ impl Config {
                 .parse()
                 .expect("PGSQL_BATCH_INTERVAL 는 양의 정수여야 합니다"),
 
-            api_key: std::env::var("API_KEY").ok().filter(|s| !s.is_empty()),
+            api_key: std::env::var("API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .expect("API_KEY 환경변수가 필수입니다 — X-API-Key 인증에 사용됩니다"),
 
             http_rate_per_second: std::env::var("HTTP_RATE_PER_SECOND")
-                .unwrap_or_else(|_| "100".to_string())
+                .unwrap_or_else(|_| "20".to_string())
                 .parse()
                 .expect("HTTP_RATE_PER_SECOND 는 양의 정수여야 합니다"),
 
             http_rate_burst: std::env::var("HTTP_RATE_BURST")
-                .unwrap_or_else(|_| "200".to_string())
+                .unwrap_or_else(|_| "50".to_string())
                 .parse()
                 .expect("HTTP_RATE_BURST 는 양의 정수여야 합니다"),
 

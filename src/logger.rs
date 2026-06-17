@@ -49,7 +49,7 @@ impl Write for HourlyWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let now = Local::now();
         let (year, month, day, hour) = (now.year(), now.month(), now.day(), now.hour());
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.year != year || inner.month != month || inner.day != day || inner.hour != hour {
             if let Ok(new_inner) = Inner::open(&self.base, year, month, day, hour) {
                 *inner = new_inner;
@@ -59,6 +59,6 @@ impl Write for HourlyWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.lock().unwrap().file.flush()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).file.flush()
     }
 }

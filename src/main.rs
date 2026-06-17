@@ -29,7 +29,11 @@ use realtime_ingestion::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::from_path("/var/www/app/.env");
+    match dotenvy::from_path("/var/www/app/.env") {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[경고] .env 로드 실패: {e}"),
+    }
 
     // 파일 로그: /var/www/log/realtime-ingestion/{년}/{월}/{일}/{시}.log
     let file_writer = logger::HourlyWriter::new("/var/www/log/realtime-ingestion")?;
@@ -102,7 +106,7 @@ async fn main() -> Result<()> {
     // ── HTTP 보안 레이어 ──────────────────────────────────────────────────────
 
     // 1. API 키 검증 — /events 에만 적용 (/health 는 제외)
-    let api_key = Arc::new(cfg.api_key.clone());
+    let api_key = Arc::new(cfg.api_key.clone()); // Arc<String>
     let api_key_layer = {
         let key = api_key.clone();
         axum::middleware::from_fn(move |req: Request, next: Next| {
@@ -145,7 +149,7 @@ async fn main() -> Result<()> {
     tracing::info!("HTTP 서버 시작: http://{}", cfg.server_addr);
     tracing::info!(
         "보안 설정 — API 키: {}, Rate: {}req/s (burst {}), 바디: {}B",
-        cfg.api_key.as_deref().map(|_| "활성화").unwrap_or("비활성화"),
+        "활성화",
         cfg.http_rate_per_second,
         cfg.http_rate_burst,
         cfg.http_max_body_bytes,

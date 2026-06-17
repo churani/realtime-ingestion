@@ -31,7 +31,12 @@ impl Notifier {
             .send()
             .await
         {
-            tracing::warn!(error = ?e, "텔레그램 알림 전송 실패");
+            // reqwest 에러에 URL(봇 토큰 포함)이 들어갈 수 있으므로 status만 기록
+            let kind = if e.is_timeout() { "timeout" }
+                else if e.is_connect() { "connect" }
+                else if e.is_status() { "status" }
+                else { "unknown" };
+            tracing::warn!(kind, "텔레그램 알림 전송 실패");
         }
     }
 }

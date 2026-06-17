@@ -65,9 +65,9 @@ pub async fn start(
             if let Err(e) = handle_connection(stream, state, max_frame_bytes).await {
                 tracing::error!(ip = %peer_ip, error = ?e, "TCP 연결 처리 오류");
                 if let Some(n) = &notifier {
+                    // 에러 원문 대신 종류만 전송 — 내부 정보 노출 방지
                     n.notify(&format!(
-                        "🔴 <b>[TCP 리스너]</b> 연결 오류 (IP: {})\n<code>{}</code>",
-                        peer_ip, e
+                        "🔴 <b>[TCP 리스너]</b> 연결 오류 (IP: {peer_ip})"
                     ))
                     .await;
                 }
@@ -93,7 +93,20 @@ async fn handle_connection(
     let mut tmp = [0u8; 4096];
 
     loop {
-        let n = stream.read(&mut tmp).await?;
+        // 30초 이상 데이터 없으면 idle 연결로 간주해 종료 (slow-loris 방어)
+        let n = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            stream.read(&mut tmp),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                tracing::warn!("TCP 연결 idle timeout (30초)");
+                return Ok(());
+            }
+        };
         if n == 0 {
             tracing::info!("TCP 연결 종료 (EOF)");
             return Ok(());
@@ -134,8 +147,9 @@ async fn process_frame(frame: &[u8], state: &AppState) {
             tracing::debug!(id = %msg.id, "중복 TCP 이벤트 무시");
         }
         Err(e) => {
-            tracing::warn!(error = ?e, id = %msg.id, "dedup 실패, 중복 체크 없이 발행");
-            let _ = state.producer.publish(&msg).await;
+            // HTTP 경로와 동일하게: Redis 장애 시 dedup 없이 발행하지 않고 드롭
+            // 단말기는 응답 없음 → 재전송 → Redis 복구 후 처리
+            tracing::warn!(error = ?e, id = %msg.id, "dedup 실패, 이벤트 드롭 (Redis 장애)");
         }
     }
 }
@@ -150,6 +164,12 @@ fn extract_frame(buf: &mut Vec<u8>, max_frame_bytes: usize) -> Option<Vec<u8>> {
 
     let len_str = std::str::from_utf8(&buf[0..4]).ok()?;
     let payload_len: usize = len_str.trim().parse().ok()?;
+
+    // 빈 프레임 거부 — dedup 키 네임스페이스 오염 방지
+    if payload_len == 0 {
+        buf.clear();
+        return None;
+    }
 
     // 비정상적으로 큰 프레임 — 버퍼를 폐기하고 연결을 계속 유지
     if payload_len > max_frame_bytes {

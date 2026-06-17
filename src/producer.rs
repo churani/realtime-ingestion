@@ -1,0 +1,143 @@
+use anyhow::Result;
+use lapin::{
+    options::{
+        BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions,
+        QueueDeclareOptions,
+    },
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+};
+
+use crate::models::QueueMessage;
+
+/// RabbitMQ 메시지 발행자.
+///
+/// 아키텍처:
+///   Fanout Exchange "events"
+///     ├── queue.transactions  → MySQL 소비자
+///     └── queue.analytics     → PostgreSQL 소비자
+///
+///   Fanout을 쓰는 이유:
+///   하나의 이벤트를 두 소비자가 동시에 받아야 하므로,
+///   라우팅 키 없이 바인딩된 모든 큐에 복사 전달하는 fanout이 가장 적합하다.
+///
+///   Publisher Confirms(발행 확인) 활성화:
+///   basic_publish 후 브로커가 ACK를 보낼 때까지 대기하므로
+///   메시지 유실 없이 "최소 1회 전달" 을 보장한다.
+///   (단, 소비자 측 중복 처리도 ON DUPLICATE KEY UPDATE 로 보완)
+///
+/// `Channel`은 내부적으로 Arc로 래핑되어 있어 Clone이 공짜다.
+/// Mutex 없이도 concurrent publish가 가능하다.
+#[derive(Clone)]
+pub struct Producer {
+    /// lapin AMQP 채널 (Arc 기반, Clone 가능)
+    channel: Channel,
+
+    /// 발행할 exchange 이름
+    exchange: String,
+}
+
+impl Producer {
+    /// AMQP 연결 → 채널 생성 → exchange·큐 선언 → 큐 바인딩을 순서대로 수행한다.
+    ///
+    /// # Arguments
+    /// - `amqp_url` : AMQP 연결 문자열
+    /// - `exchange_name` : 생성할 fanout exchange 이름
+    /// - `queues` : 바인딩할 큐 이름 목록 (모두 durable로 선언됨)
+    pub async fn connect(
+        amqp_url: &str,
+        exchange_name: &str,
+        queues: &[&str],
+    ) -> Result<Self> {
+        // 1) 브로커 연결
+        let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
+
+        // 2) 채널 생성 — 연결 당 여러 채널을 만들 수 있지만
+        //    단일 채널로 100+ req/s 처리는 충분하다
+        let channel = conn.create_channel().await?;
+
+        // 3) Publisher Confirms 모드 활성화
+        //    이후 basic_publish()가 PublisherConfirm 타입을 반환하며,
+        //    이를 await 해야 브로커 ACK/NACK를 확인할 수 있다
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await?;
+
+        // 4) Fanout Exchange 선언 (이미 존재하면 설정이 일치할 때 그대로 사용)
+        //    durable=true : 브로커 재시작 후에도 exchange가 살아있음
+        channel
+            .exchange_declare(
+                exchange_name,
+                ExchangeKind::Fanout, // 라우팅 키 무시, 모든 바인딩 큐로 복사
+                ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        // 5) 각 큐 선언 + exchange에 바인딩
+        for queue_name in queues {
+            // durable=true : 브로커 재시작 후에도 큐와 메시지가 유지됨
+            channel
+                .queue_declare(
+                    queue_name,
+                    QueueDeclareOptions {
+                        durable: true,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await?;
+
+            // fanout exchange는 routing_key("")를 무시하므로 빈 문자열로 충분
+            channel
+                .queue_bind(
+                    queue_name,
+                    exchange_name,
+                    "", // fanout에서 routing key는 무의미
+                    QueueBindOptions::default(),
+                    FieldTable::default(),
+                )
+                .await?;
+        }
+
+        Ok(Self {
+            channel,
+            exchange: exchange_name.to_string(),
+        })
+    }
+
+    /// 메시지를 exchange에 발행하고 브로커 ACK를 기다린다.
+    ///
+    /// delivery_mode=2 로 설정해 디스크에 영속 저장(Persistent)시키므로
+    /// 브로커가 재시작되더라도 큐에 남아있다.
+    ///
+    /// 브로커가 NACK를 보내거나 타임아웃이 발생하면 Err를 반환한다.
+    pub async fn publish(&self, msg: &QueueMessage) -> Result<()> {
+        // 구조체를 JSON 바이트로 직렬화
+        let body = serde_json::to_vec(msg)?;
+
+        // basic_publish 반환값은 PublisherConfirm (아직 ACK를 받지 않은 상태)
+        let confirm = self
+            .channel
+            .basic_publish(
+                &self.exchange, // fanout exchange
+                "",             // routing key (fanout에서 무시됨)
+                BasicPublishOptions::default(),
+                &body,
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_delivery_mode(2), // 2 = Persistent (디스크 저장)
+            )
+            .await?;
+
+        // 브로커로부터 실제 ACK를 기다림 — 여기서 블로킹
+        // ACK = 메시지가 브로커 큐에 안전하게 기록됨
+        // NACK = 브로커가 메시지를 거부함 (큐 꽉 참 등)
+        confirm.await?;
+
+        Ok(())
+    }
+}

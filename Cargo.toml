@@ -33,6 +33,14 @@ sqlx        = { version = "0.7",  features = ["runtime-tokio-rustls", "mysql", "
 # 구조화 로깅
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender   = "0.2"
+chrono      = { version = "0.4", features = ["clock"] }
+
+# 텔레그램 Bot API HTTP 요청
+reqwest     = { version = "0.12", features = ["json"] }
+
+# EUC-KR 인코딩 변환 (POS 단말기 → UTF-8)
+encoding_rs = "0.8"
 
 # 편의 에러 처리 — Box<dyn Error>를 ? 로 전파
 anyhow      = "1"

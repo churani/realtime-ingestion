@@ -30,6 +30,19 @@ pub struct Config {
 
     /// PostgreSQL 소비자가 구독할 큐 이름
     pub postgres_queue: String,
+
+    /// 텔레그램 Bot 토큰 (미설정 시 알림 비활성화)
+    pub telegram_bot_token: Option<String>,
+
+    /// 텔레그램 알림을 받을 Chat ID
+    pub telegram_chat_id: Option<String>,
+
+    /// TCP 리스너 바인딩 주소 (예: "0.0.0.0:38701")
+    pub tcp_addr: String,
+
+    /// TCP 접속을 허용할 IP 목록. 비어있으면 모든 IP 허용.
+    /// 환경변수 ALLOWED_IPS에 쉼표로 구분해 설정 (예: "192.168.1.10,10.0.0.5")
+    pub allowed_ips: Vec<std::net::IpAddr>,
 }
 
 impl Config {
@@ -63,6 +76,18 @@ impl Config {
 
             postgres_queue: std::env::var("POSTGRES_QUEUE")
                 .unwrap_or_else(|_| "queue.analytics".to_string()),
+
+            telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN").ok(),
+            telegram_chat_id: std::env::var("TELEGRAM_CHAT_ID").ok(),
+
+            tcp_addr: std::env::var("TCP_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:38701".to_string()),
+
+            allowed_ips: std::env::var("ALLOWED_IPS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect(),
         }
     }
 }

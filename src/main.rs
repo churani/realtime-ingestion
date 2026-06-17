@@ -12,9 +12,13 @@
 mod config;
 mod consumer;
 mod dedup;
+mod logger;
 mod models;
+mod parser;
 mod producer;
 mod receiver;
+mod tcp_listener;
+mod telegram;
 
 use std::sync::Arc;
 
@@ -34,21 +38,39 @@ use receiver::AppState;
 #[tokio::main]
 async fn main() -> Result<()> {
     // .env 파일이 있으면 로드 (없어도 무시 — 운영 환경에서는 실제 환경변수 사용)
-    let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_path("/var/www/app/.env");
 
     // 구조화 로깅 초기화
+    // 파일: /var/www/log/realtime-ingestion/{년}/{월}/{일}/{시}.log
     // RUST_LOG=realtime_ingestion=debug 로 상세 로그 활성화 가능
+    let file_writer = logger::HourlyWriter::new("/var/www/log/realtime-ingestion")?;
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_writer);
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "realtime_ingestion=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer())                           // 터미널 출력
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking)) // 파일 출력 (시간별)
         .init();
 
     // 환경변수에서 설정 로드 (필수 항목 없으면 여기서 패닉)
     let cfg = Config::from_env();
     tracing::info!("설정 로드 완료: {:#?}", cfg);
+
+    // ── 텔레그램 알림 초기화 ──────────────────────────────────────────
+    // TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 둘 다 설정돼야 활성화
+    let notifier = match (cfg.telegram_bot_token.clone(), cfg.telegram_chat_id.clone()) {
+        (Some(token), Some(chat_id)) => {
+            tracing::info!("텔레그램 알림 활성화");
+            Some(telegram::Notifier::new(token, chat_id))
+        }
+        _ => {
+            tracing::info!("텔레그램 알림 비활성화 (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 미설정)");
+            None
+        }
+    };
 
     // ── 의존성 초기화 ─────────────────────────────────────────────────
 
@@ -93,9 +115,10 @@ async fn main() -> Result<()> {
         let queue    = cfg.mysql_queue.clone();
         let pool     = mysql_pool.clone();
 
+        let notifier = notifier.clone();
         tokio::spawn(async move {
             loop {
-                match consumer::mysql::run(&amqp_url, &queue, pool.clone()).await {
+                match consumer::mysql::run(&amqp_url, &queue, pool.clone(), notifier.clone()).await {
                     Ok(_)  => tracing::warn!("MySQL 소비자 정상 종료, 5초 후 재시작"),
                     Err(e) => tracing::error!(error = ?e, "MySQL 소비자 오류, 5초 후 재시작"),
                 }
@@ -110,9 +133,10 @@ async fn main() -> Result<()> {
         let queue    = cfg.postgres_queue.clone();
         let pool     = pg_pool.clone();
 
+        let notifier = notifier.clone();
         tokio::spawn(async move {
             loop {
-                match consumer::postgres::run(&amqp_url, &queue, pool.clone()).await {
+                match consumer::postgres::run(&amqp_url, &queue, pool.clone(), notifier.clone()).await {
                     Ok(_)  => tracing::warn!("PostgreSQL 소비자 정상 종료, 5초 후 재시작"),
                     Err(e) => tracing::error!(error = ?e, "PostgreSQL 소비자 오류, 5초 후 재시작"),
                 }
@@ -120,6 +144,26 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // ── TCP 리스너 시작 ───────────────────────────────────────────────
+    // 카드 단말기 → SEND[LLLL{payload}] 전문 수신
+    {
+        let addr      = cfg.tcp_addr.clone();
+        let ips       = cfg.allowed_ips.clone();
+        let state     = state.clone();
+        let notifier  = notifier.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match tcp_listener::start(&addr, ips.clone(), state.clone(), notifier.clone()).await {
+                    Ok(_)  => tracing::warn!("TCP 리스너 종료, 5초 후 재시작"),
+                    Err(e) => tracing::error!(error = ?e, "TCP 리스너 오류, 5초 후 재시작"),
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+    tracing::info!("TCP 리스너 시작: {} (허용 IP: {:?})", cfg.tcp_addr, cfg.allowed_ips);
 
     // ── HTTP 서버 시작 ────────────────────────────────────────────────
     let app = Router::new()

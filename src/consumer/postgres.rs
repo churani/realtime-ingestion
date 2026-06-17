@@ -11,6 +11,8 @@
 ///   JSONB = 파싱된 바이너리 저장 → 인덱스 생성 가능 (GIN), 쿼리 속도 우수
 ///   JSON  = 텍스트 원본 저장 → 입력 순서 보존, 인덱스 불가
 ///   분석 용도이므로 JSONB를 선택한다.
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures::StreamExt;
 use lapin::{
@@ -21,12 +23,13 @@ use lapin::{
 use sqlx::{types::Json, PgPool};
 
 use crate::models::QueueMessage;
+use crate::telegram::Notifier;
 
 /// PostgreSQL 소비자 루프를 실행한다.
 ///
 /// MySQL 소비자와 동일한 재시작 패턴을 사용한다.
 /// 두 소비자는 각자 독립된 AMQP 연결·채널을 가지므로 서로 영향을 주지 않는다.
-pub async fn run(amqp_url: &str, queue_name: &str, pool: PgPool) -> Result<()> {
+pub async fn run(amqp_url: &str, queue_name: &str, pool: PgPool, notifier: Option<Arc<Notifier>>) -> Result<()> {
     let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
 
@@ -50,6 +53,9 @@ pub async fn run(amqp_url: &str, queue_name: &str, pool: PgPool) -> Result<()> {
             Ok(d) => d,
             Err(e) => {
                 tracing::error!(error = ?e, "PostgreSQL 소비자 채널 오류");
+                if let Some(n) = &notifier {
+                    n.notify(&format!("🔴 <b>[PostgreSQL 소비자]</b> 채널 오류\n<code>{e}</code>")).await;
+                }
                 return Err(e.into());
             }
         };
@@ -61,6 +67,9 @@ pub async fn run(amqp_url: &str, queue_name: &str, pool: PgPool) -> Result<()> {
             }
             Err(e) => {
                 tracing::error!(error = ?e, "PostgreSQL insert 실패, 재큐잉");
+                if let Some(n) = &notifier {
+                    n.notify(&format!("⚠️ <b>[PostgreSQL 소비자]</b> insert 실패 (재큐잉)\n<code>{e}</code>")).await;
+                }
                 delivery
                     .nack(BasicNackOptions {
                         requeue: true,

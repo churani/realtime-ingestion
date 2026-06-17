@@ -8,6 +8,8 @@
 ///   DB 저장 성공 → ACK (브로커에서 메시지 삭제)
 ///   DB 저장 실패 → NACK + requeue=true (브로커가 메시지를 다시 큐에 넣음)
 ///   → ON DUPLICATE KEY UPDATE 로 재시도 시 멱등성 보장
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures::StreamExt;
 use lapin::{
@@ -18,12 +20,13 @@ use lapin::{
 use sqlx::MySqlPool;
 
 use crate::models::QueueMessage;
+use crate::telegram::Notifier;
 
 /// MySQL 소비자 루프를 실행한다.
 ///
 /// 연결이 끊기거나 치명적 오류가 발생하면 Err를 반환한다.
 /// main.rs에서 `loop { run(...).await; sleep(5s) }` 패턴으로 자동 재시작한다.
-pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool) -> Result<()> {
+pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool, notifier: Option<Arc<Notifier>>) -> Result<()> {
     // 소비자 전용 AMQP 연결 — 발행자와 연결을 분리하는 것이 lapin 권장 패턴
     // (연결 하나에 여러 채널을 열 수 있지만, 소비자는 전용 연결이 더 안전하다)
     let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
@@ -55,6 +58,9 @@ pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool) -> Result<()
             Err(e) => {
                 // 채널/연결 레벨 오류 — 루프를 탈출해 재연결 유도
                 tracing::error!(error = ?e, "MySQL 소비자 채널 오류");
+                if let Some(n) = &notifier {
+                    n.notify(&format!("🔴 <b>[MySQL 소비자]</b> 채널 오류\n<code>{e}</code>")).await;
+                }
                 return Err(e.into());
             }
         };
@@ -71,6 +77,9 @@ pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool) -> Result<()
                 // 주의: 영구적 오류(잘못된 JSON 등)는 무한 재시도가 됨
                 //       운영 환경에서는 재시도 횟수 제한 + DLQ 패턴 추가 필요
                 tracing::error!(error = ?e, "MySQL insert 실패, 재큐잉");
+                if let Some(n) = &notifier {
+                    n.notify(&format!("⚠️ <b>[MySQL 소비자]</b> insert 실패 (재큐잉)\n<code>{e}</code>")).await;
+                }
                 delivery
                     .nack(BasicNackOptions {
                         requeue: true,

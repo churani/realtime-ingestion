@@ -66,8 +66,12 @@ pub fn parse_frame(frame: &[u8]) -> Result<QueueMessage> {
     let acquirer_code   = field(payload, 111, 3);  // No.16 매입사코드
     let acquirer_name   = field(payload, 114, 14); // No.17 매입사명 (EUC-KR 한글)
     let merchant_no     = field(payload, 128, 14); // No.18 가맹점번호
-    let business_no     = field(payload, 142, 10); // No.19 사업자번호
+    let business_no_raw = field(payload, 142, 10); // No.19 사업자번호
     let cancel_flag     = field(payload, 152, 1);  // No.20 취소구분
+
+    // 로그·큐 전송 데이터에서 민감정보 마스킹
+    let card_no_masked  = crate::security::mask_card_no(&card_no);
+    let business_no     = crate::security::mask_business_no(&business_no_raw);
     // No.21 filler (offset:153, len:17) — 무시
 
     let now_ms = SystemTime::now()
@@ -87,7 +91,7 @@ pub fn parse_frame(frame: &[u8]) -> Result<QueueMessage> {
             "terminal_no":     terminal_no,
             "installment":     installment,
             "amount":          amount,
-            "card_no":         card_no,
+            "card_no":         card_no_masked,
             "approval_no":     approval_no,
             "approval_date":   approval_date,
             "approval_time":   approval_time,

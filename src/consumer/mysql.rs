@@ -1,91 +1,116 @@
-/// MySQL 소비자 — 트랜잭션 원본 이벤트 저장 담당.
+/// MySQL 소비자 — 배치 INSERT 모드.
 ///
-/// 역할 분리 전략:
-///   MySQL은 정규화된 트랜잭션 기록에 강하므로 원본 이벤트 레코드를 저장한다.
-///   이후 결제 처리, 포인트 적립, 환불 등 row-level 트랜잭션 쿼리의 기준이 된다.
+/// 동작 방식:
+///   메시지를 즉시 INSERT 하지 않고 배치를 쌓은 뒤 한 번에 처리한다.
 ///
-/// ACK 전략 (At-Least-Once):
-///   DB 저장 성공 → ACK (브로커에서 메시지 삭제)
-///   DB 저장 실패 → NACK + requeue=true (브로커가 메시지를 다시 큐에 넣음)
-///   → ON DUPLICATE KEY UPDATE 로 재시도 시 멱등성 보장
+///   flush 조건 (둘 중 먼저 충족되는 쪽):
+///     1. 배치 크기(MYSQL_BATCH_SIZE) 도달
+///     2. 배치 인터벌(MYSQL_BATCH_INTERVAL 초) 경과
+///
+///   INSERT … VALUES (r1),(r2),…,(rN) ON DUPLICATE KEY UPDATE
+///   → 단일 왕복으로 N건 처리, 처리량 대폭 향상
+///
+/// ACK 전략:
+///   INSERT 성공 → 배치 전체 ACK
+///   INSERT 실패 → 배치 전체 NACK + requeue (텔레그램 알림)
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
 use lapin::{
+    message::Delivery,
     options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
     types::FieldTable,
     Connection, ConnectionProperties,
 };
-use sqlx::MySqlPool;
+use sqlx::{MySqlPool, QueryBuilder};
 
 use crate::models::QueueMessage;
 use crate::telegram::Notifier;
 
-/// MySQL 소비자 루프를 실행한다.
-///
-/// 연결이 끊기거나 치명적 오류가 발생하면 Err를 반환한다.
-/// main.rs에서 `loop { run(...).await; sleep(5s) }` 패턴으로 자동 재시작한다.
-pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool, notifier: Option<Arc<Notifier>>) -> Result<()> {
-    // 소비자 전용 AMQP 연결 — 발행자와 연결을 분리하는 것이 lapin 권장 패턴
-    // (연결 하나에 여러 채널을 열 수 있지만, 소비자는 전용 연결이 더 안전하다)
+pub async fn run(
+    amqp_url: &str,
+    queue_name: &str,
+    pool: MySqlPool,
+    notifier: Option<Arc<Notifier>>,
+    batch_size: usize,
+    batch_interval_secs: u64,
+) -> Result<()> {
     let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
 
-    // Prefetch 설정: 소비자가 한 번에 미확인 상태로 받을 수 있는 최대 메시지 수
-    // 너무 크면 소비자 OOM, 너무 작으면 브로커-소비자 왕복 지연이 생김
-    // 100 req/s에서 DB 저장이 ~5ms라면 50개면 충분히 파이프라인됨
-    channel
-        .basic_qos(50, BasicQosOptions { global: false })
-        .await?;
+    // prefetch: 배치 크기의 2배로 설정해 브로커로부터 충분히 미리 받아둠
+    let prefetch = ((batch_size * 2) as u16).max(50);
+    channel.basic_qos(prefetch, BasicQosOptions { global: false }).await?;
 
-    // 소비자 등록 — "mysql-consumer" 태그로 RabbitMQ 관리 UI에서 식별 가능
     let mut consumer = channel
         .basic_consume(
             queue_name,
-            "mysql-consumer",               // consumer tag
-            BasicConsumeOptions::default(), // auto_ack=false (수동 ACK)
+            "mysql-consumer",
+            BasicConsumeOptions::default(),
             FieldTable::default(),
         )
         .await?;
 
-    tracing::info!(queue = %queue_name, "MySQL 소비자 시작");
+    tracing::info!(
+        queue = %queue_name,
+        batch_size,
+        batch_interval_secs,
+        "MySQL 소비자 시작 (배치 모드)"
+    );
 
-    // Delivery 스트림에서 메시지를 하나씩 꺼내 처리
-    while let Some(delivery) = consumer.next().await {
-        let delivery = match delivery {
-            Ok(d) => d,
-            Err(e) => {
-                // 채널/연결 레벨 오류 — 루프를 탈출해 재연결 유도
-                tracing::error!(error = ?e, "MySQL 소비자 채널 오류");
-                if let Some(n) = &notifier {
-                    n.notify(&format!("🔴 <b>[MySQL 소비자]</b> 채널 오류\n<code>{e}</code>")).await;
-                }
-                return Err(e.into());
-            }
-        };
+    let mut deliveries: Vec<Delivery> = Vec::with_capacity(batch_size);
+    let mut rows: Vec<(String, String, String, i64, i64)> = Vec::with_capacity(batch_size);
 
-        match insert_event(&delivery.data, &pool).await {
-            Ok(_) => {
-                // 저장 성공 → 브로커에 ACK 전송 → 브로커가 큐에서 메시지 삭제
-                delivery.ack(BasicAckOptions::default()).await?;
-                tracing::debug!("MySQL ACK 완료");
-            }
-            Err(e) => {
-                // 저장 실패 → NACK + 재큐잉
-                // requeue=true: 브로커가 메시지를 큐 앞쪽에 다시 넣음
-                // 주의: 영구적 오류(잘못된 JSON 등)는 무한 재시도가 됨
-                //       운영 환경에서는 재시도 횟수 제한 + DLQ 패턴 추가 필요
-                tracing::error!(error = ?e, "MySQL insert 실패, 재큐잉");
-                if let Some(n) = &notifier {
-                    n.notify(&format!("⚠️ <b>[MySQL 소비자]</b> insert 실패 (재큐잉)\n<code>{e}</code>")).await;
+    // 배치 인터벌 타이머 — 첫 tick은 즉시 발생하므로 미리 소비
+    let mut ticker = tokio::time::interval(Duration::from_secs(batch_interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            // ── 새 메시지 도착 ───────────────────────────────────────────
+            item = consumer.next() => {
+                match item {
+                    None => break,
+                    Some(Err(e)) => {
+                        tracing::error!(error = ?e, "MySQL 소비자 채널 오류");
+                        if let Some(n) = &notifier {
+                            n.notify(&format!(
+                                "🔴 <b>[MySQL 소비자]</b> 채널 오류\n<code>{e}</code>"
+                            )).await;
+                        }
+                        return Err(e.into());
+                    }
+                    Some(Ok(delivery)) => {
+                        match parse_delivery(&delivery.data) {
+                            Ok(row) => {
+                                rows.push(row);
+                                deliveries.push(delivery);
+                            }
+                            Err(e) => {
+                                // 파싱 실패 → 재큐 없이 버림 (깨진 메시지 무한루프 방지)
+                                tracing::error!(error = ?e, "메시지 파싱 실패, 폐기");
+                                let _ = delivery
+                                    .nack(BasicNackOptions { requeue: false, multiple: false })
+                                    .await;
+                            }
+                        }
+
+                        // 배치 크기 도달 → 즉시 flush
+                        if rows.len() >= batch_size {
+                            flush(&mut deliveries, &mut rows, &pool, &notifier).await;
+                        }
+                    }
                 }
-                delivery
-                    .nack(BasicNackOptions {
-                        requeue: true,
-                        multiple: false,
-                    })
-                    .await?;
+            }
+
+            // ── 배치 인터벌 경과 ─────────────────────────────────────────
+            _ = ticker.tick() => {
+                if !rows.is_empty() {
+                    flush(&mut deliveries, &mut rows, &pool, &notifier).await;
+                }
             }
         }
     }
@@ -93,36 +118,54 @@ pub async fn run(amqp_url: &str, queue_name: &str, pool: MySqlPool, notifier: Op
     Ok(())
 }
 
-/// 메시지 바이트를 파싱해 MySQL `events` 테이블에 저장한다.
-async fn insert_event(data: &[u8], pool: &MySqlPool) -> Result<()> {
-    // JSON 역직렬화
+/// 누적된 배치를 MySQL에 단일 INSERT로 처리한다.
+async fn flush(
+    deliveries: &mut Vec<Delivery>,
+    rows: &mut Vec<(String, String, String, i64, i64)>,
+    pool: &MySqlPool,
+    notifier: &Option<Arc<Notifier>>,
+) {
+    let count = rows.len();
+
+    // INSERT ... VALUES (r1),(r2),... ON DUPLICATE KEY UPDATE
+    let mut qb = QueryBuilder::new(
+        "INSERT INTO events (id, event_type, payload, timestamp, received_at) ",
+    );
+    qb.push_values(rows.iter(), |mut b, (id, event_type, payload, ts, recv)| {
+        b.push_bind(id)
+         .push_bind(event_type)
+         .push_bind(payload)
+         .push_bind(ts)
+         .push_bind(recv);
+    });
+    qb.push(" ON DUPLICATE KEY UPDATE received_at = VALUES(received_at)");
+
+    match qb.build().execute(pool).await {
+        Ok(_) => {
+            tracing::info!(count, "MySQL 배치 INSERT 완료");
+            for d in deliveries.drain(..) {
+                let _ = d.ack(BasicAckOptions::default()).await;
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, count, "MySQL 배치 INSERT 실패, 재큐잉");
+            if let Some(n) = notifier {
+                n.notify(&format!(
+                    "⚠️ <b>[MySQL 소비자]</b> 배치 INSERT 실패 ({count}건)\n<code>{e}</code>"
+                )).await;
+            }
+            for d in deliveries.drain(..) {
+                let _ = d.nack(BasicNackOptions { requeue: true, multiple: false }).await;
+            }
+        }
+    }
+
+    rows.clear();
+}
+
+/// RabbitMQ 메시지 바이트를 파싱해 INSERT용 튜플로 변환한다.
+fn parse_delivery(data: &[u8]) -> Result<(String, String, String, i64, i64)> {
     let msg: QueueMessage = serde_json::from_slice(data)?;
-
-    // MySQL JSON 컬럼은 내부적으로 바이너리 포맷으로 저장되지만
-    // sqlx 0.7에서 serde_json::Value → MySQL JSON 직접 바인딩이 불안정하므로
-    // 문자열로 직렬화한 뒤 바인딩한다 (MySQL이 알아서 JSON 유효성 검사)
     let payload_str = serde_json::to_string(&msg.payload)?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO events
-            (id, event_type, payload, timestamp, received_at)
-        VALUES
-            (?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-            -- 같은 id가 재시도로 들어오면 received_at만 업데이트
-            -- (payload, event_type은 첫 기록이 정본이므로 변경 안 함)
-            received_at = VALUES(received_at)
-        "#,
-    )
-    .bind(&msg.id)
-    .bind(&msg.event_type)
-    .bind(&payload_str) // TEXT → MySQL이 JSON으로 저장
-    .bind(msg.timestamp)
-    .bind(msg.received_at)
-    .execute(pool)
-    .await?;
-
-    tracing::debug!(event_id = %msg.id, "MySQL events 저장 완료");
-    Ok(())
+    Ok((msg.id, msg.event_type, payload_str, msg.timestamp, msg.received_at))
 }

@@ -98,7 +98,7 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             server_addr: std::env::var("SERVER_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:8081".to_string()),
+                .unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
 
             // REDIS_URL 우선, 없으면 REDIS_HOST + REDIS_PORT 조합
             redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| {

@@ -1,4 +1,5 @@
 /// URL 패스워드에 사용할 수 없는 특수문자를 percent-encoding으로 변환한다.
+/// p@ss#word@host/db => p%40ss%23word@host/db
 fn url_encode_password(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {
@@ -15,9 +16,23 @@ fn url_encode_password(s: &str) -> String {
 /// 서비스 전체 설정값.
 /// 모든 값은 환경변수에서 읽어오며, 필수 항목이 없으면 패닉으로 즉시 종료한다.
 /// (잘못된 설정으로 서버가 반쯤 뜨는 것보다 빠른 실패가 낫다.)
+/// // derive(Debug) 가 자동으로 이걸 생성해줌
+///impl std::fmt::Debug for Config {
+///    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+///        write!(f, "Config {{ postgres_url: {:?} }}", self.postgres_url)
+///    }
+///} => 코드가 뻔하니까 컴파일러가 자동으로 생성해줘.
+/// println!("{:?}", config); => 구조체 전체 출력
+/// {:?}  → 구조체 전체 한 줄로
+/// {:#?} → 구조체 전체 들여쓰기로 (보기 좋음)
+/// {}    → Debug 아닌 일반 출력 (String, 숫자 등 기본 타입만)
+/// Debug    → 출력/로깅용
+/// Clone    → 복사 가능
+/// PartialEq → == 비교 가능
+/// Serialize/Deserialize → JSON 변환 (serde)
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// HTTP 서버 바인딩 주소 (예: "0.0.0.0:8080")
+    /// HTTP 서버 바인딩 주소 (예: "0.0.0.0:8081")
     pub server_addr: String,
 
     /// Redis 연결 URL (예: "redis://127.0.0.1:6379")
@@ -30,6 +45,7 @@ pub struct Config {
     pub mysql_url: String,
 
     /// PostgreSQL 연결 URL. None이면 PostgreSQL 소비자를 비활성화한다.
+    /// Option<String> 값이 있을 수도 있고 없을 수도 있을 때 사용
     pub postgres_url: Option<String>,
 
     /// Redis에서 중복 키를 유지할 TTL (초). 기본 300초(5분).
@@ -44,6 +60,15 @@ pub struct Config {
 
     /// PostgreSQL 소비자가 구독할 큐 이름
     pub postgres_queue: String,
+
+    /// Dead Letter Exchange 이름 (실패 메시지 수신 exchange)
+    pub dlq_exchange: String,
+
+    /// MySQL 실패 메시지 DLQ 이름
+    pub mysql_dlq_queue: String,
+
+    /// PostgreSQL 실패 메시지 DLQ 이름
+    pub postgres_dlq_queue: String,
 
     /// 텔레그램 Bot 토큰 (미설정 시 알림 비활성화)
     pub telegram_bot_token: Option<String>,
@@ -95,6 +120,7 @@ pub struct Config {
 }
 
 impl Config {
+    // self는 config와 같습니다
     pub fn from_env() -> Self {
         Self {
             server_addr: std::env::var("SERVER_ADDR")
@@ -147,11 +173,11 @@ impl Config {
             }),
 
             // DEDUP_TTL_SECS 우선, 없으면 REDIS_TTL, 없으면 300초
-            dedup_ttl_secs: std::env::var("DEDUP_TTL_SECS")
-                .or_else(|_| std::env::var("REDIS_TTL"))
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .expect("DEDUP_TTL_SECS 는 양의 정수여야 합니다"),
+            dedup_ttl_secs: std::env::var("DEDUP_TTL_SECS")   // 1. 환경변수 DEDUP_TTL_SECS 읽기
+                .or_else(|_| std::env::var("REDIS_TTL")) // 2. 없으면 REDIS_TTL 읽기
+                .unwrap_or_else(|_| "300".to_string()) // 3. 둘 다 없으면 "300" 기본값
+                .parse() // 4. String → 숫자로 변환
+                .expect("DEDUP_TTL_SECS 는 양의 정수여야 합니다"),// 5. 변환 실패시 에러메시지
 
             exchange_name: std::env::var("EXCHANGE_NAME")
                 .unwrap_or_else(|_| "events".to_string()),
@@ -161,6 +187,15 @@ impl Config {
 
             postgres_queue: std::env::var("POSTGRES_QUEUE")
                 .unwrap_or_else(|_| "queue.analytics".to_string()),
+
+            dlq_exchange: std::env::var("DLQ_EXCHANGE")
+                .unwrap_or_else(|_| "events.dlq".to_string()),
+
+            mysql_dlq_queue: std::env::var("MYSQL_DLQ_QUEUE")
+                .unwrap_or_else(|_| "dlq.transactions".to_string()),
+
+            postgres_dlq_queue: std::env::var("POSTGRES_DLQ_QUEUE")
+                .unwrap_or_else(|_| "dlq.analytics".to_string()),
 
             // TELEGRAM_BOT_TOKEN 우선, 없으면 TELE_TOKEN
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")

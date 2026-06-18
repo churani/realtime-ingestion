@@ -1,0 +1,20 @@
+[Unit]
+Description=Realtime Ingestion Receiver (HTTP :8081 + TCP :38701)
+After=network.target redis.service rabbitmq-server.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+EnvironmentFile=/var/www/app/.env
+ExecStartPre=+/bin/mkdir -p /var/www/log/realtime-ingestion
+ExecStartPre=+/bin/chown -R www-data:www-data /var/www/log/realtime-ingestion
+ExecStart=/usr/local/bin/realtime-ingestion
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=realtime-ingestion
+
+[Install]
+WantedBy=multi-user.target

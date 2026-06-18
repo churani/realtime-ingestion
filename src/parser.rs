@@ -25,28 +25,21 @@ fn field(payload: &[u8], offset: usize, len: usize) -> String {
     decoded.trim().to_string()
 }
 
-/// LLLL{payload} 프레임을 파싱해 QueueMessage를 반환한다.
+/// 결제 전문 페이로드를 파싱해 QueueMessage를 반환한다.
 ///
-/// - LLLL    : 4자리 10진수, payload 길이
-/// - payload : LLLL 바이트의 고정길이 전문
+/// `frame`은 LLLL 헤더가 제거된 순수 페이로드 바이트이다.
+/// (extract_frame이 LLLL을 제거한 뒤 페이로드만 전달한다.)
 ///
 /// tran_unique_nbr(offset:12, len:12)를 이벤트 ID로 사용한다.
 pub fn parse_frame(frame: &[u8]) -> Result<QueueMessage> {
-    // ── 프레임 구조 검증 ──────────────────────────────────────────────
-    if frame.len() < 4 {
-        bail!("프레임 너무 짧음 ({}바이트)", frame.len());
-    }
-
-    // 첫 4자리가 payload 길이
-    let len_str = std::str::from_utf8(&frame[0..4])?;
-    let payload_len: usize = len_str.trim().parse()?;
-
-    if frame.len() < 4 + payload_len {
-        bail!("프레임 불완전: payload {payload_len}바이트 필요, {}바이트 있음", frame.len() - 4);
+    // ── 최소 길이 검증 ────────────────────────────────────────────────
+    // 마지막 정의 필드: cancel_flag(offset:152, len:1) → 최소 153바이트 필요
+    if frame.len() < 153 {
+        bail!("페이로드 너무 짧음 ({}바이트, 최소 153 필요)", frame.len());
     }
 
     // ── SPEC 필드 추출 ────────────────────────────────────────────────
-    let payload = &frame[4..4 + payload_len];
+    let payload = frame;
 
     let merchant_type   = field(payload, 0,   8);  // No.1  가맹점구분
     let msg_type        = field(payload, 8,   4);  // No.2  Msg Type
@@ -81,8 +74,8 @@ pub fn parse_frame(frame: &[u8]) -> Result<QueueMessage> {
 
     Ok(QueueMessage {
         id: tran_unique_nbr.clone(),
-        // msg_type으로 이벤트 종류 구분 (예: "card_tx_0200")
         event_type: format!("card_tx_{msg_type}"),
+        table_key: Some(business_no_raw.clone()),
         payload: json!({
             "merchant_type":   merchant_type,
             "msg_type":        msg_type,
@@ -108,4 +101,5 @@ pub fn parse_frame(frame: &[u8]) -> Result<QueueMessage> {
         timestamp: now_ms,
         received_at: now_ms,
     })
+
 }

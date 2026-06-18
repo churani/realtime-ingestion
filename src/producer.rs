@@ -4,7 +4,7 @@ use lapin::{
         BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions,
         QueueDeclareOptions,
     },
-    types::FieldTable,
+    types::{AMQPValue, FieldTable},
     BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
 };
 
@@ -38,69 +38,85 @@ pub struct Producer {
 }
 
 impl Producer {
-    /// AMQP 연결 → 채널 생성 → exchange·큐 선언 → 큐 바인딩을 순서대로 수행한다.
+    /// AMQP 연결 → 채널 생성 → exchange·큐·DLQ 선언 → 바인딩을 순서대로 수행한다.
     ///
     /// # Arguments
-    /// - `amqp_url` : AMQP 연결 문자열
-    /// - `exchange_name` : 생성할 fanout exchange 이름
-    /// - `queues` : 바인딩할 큐 이름 목록 (모두 durable로 선언됨)
+    /// - `amqp_url`      : AMQP 연결 문자열
+    /// - `exchange_name` : fanout exchange 이름
+    /// - `queues`        : `(큐 이름, DLQ 이름)` 쌍 목록
+    /// - `dlq_exchange`  : Dead Letter Exchange 이름
+    ///
+    /// DLQ 흐름:
+    ///   consumer nack(requeue=false)
+    ///     → RabbitMQ가 x-death 헤더(실패 이유·시각·원본 큐) 추가
+    ///     → dlq_exchange(direct)로 라우팅
+    ///     → dlq.{queue} 에 적재
+    ///
+    /// ⚠️  기존 큐가 DLX 인수 없이 선언되어 있으면 406 PRECONDITION_FAILED 발생.
+    ///     배포 전 RabbitMQ 관리 콘솔에서 기존 큐를 삭제해야 한다.
     pub async fn connect(
         amqp_url: &str,
         exchange_name: &str,
-        queues: &[&str],
+        queues: &[(&str, &str)],
+        dlq_exchange: &str,
     ) -> Result<Self> {
-        // 1) 브로커 연결
         let conn = Connection::connect(amqp_url, ConnectionProperties::default()).await?;
-
-        // 2) 채널 생성 — 연결 당 여러 채널을 만들 수 있지만
-        //    단일 채널로 100+ req/s 처리는 충분하다
         let channel = conn.create_channel().await?;
 
-        // 3) Publisher Confirms 모드 활성화
-        //    이후 basic_publish()가 PublisherConfirm 타입을 반환하며,
-        //    이를 await 해야 브로커 ACK/NACK를 확인할 수 있다
-        channel
-            .confirm_select(ConfirmSelectOptions::default())
-            .await?;
+        channel.confirm_select(ConfirmSelectOptions::default()).await?;
 
-        // 4) Fanout Exchange 선언 (이미 존재하면 설정이 일치할 때 그대로 사용)
-        //    durable=true : 브로커 재시작 후에도 exchange가 살아있음
+        // 메인 fanout exchange
         channel
             .exchange_declare(
                 exchange_name,
-                ExchangeKind::Fanout, // 라우팅 키 무시, 모든 바인딩 큐로 복사
-                ExchangeDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
+                ExchangeKind::Fanout,
+                ExchangeDeclareOptions { durable: true, ..Default::default() },
                 FieldTable::default(),
             )
             .await?;
 
-        // 5) 각 큐 선언 + exchange에 바인딩
-        for queue_name in queues {
-            // durable=true : 브로커 재시작 후에도 큐와 메시지가 유지됨
+        // DLQ direct exchange
+        channel
+            .exchange_declare(
+                dlq_exchange,
+                ExchangeKind::Direct,
+                ExchangeDeclareOptions { durable: true, ..Default::default() },
+                FieldTable::default(),
+            )
+            .await?;
+
+        for (queue_name, dlq_name) in queues {
+            // 메인 큐: x-dead-letter-exchange + x-dead-letter-routing-key 설정
+            let mut args = FieldTable::default();
+            args.insert("x-dead-letter-exchange".into(),    AMQPValue::LongString(dlq_exchange.into()));
+            args.insert("x-dead-letter-routing-key".into(), AMQPValue::LongString((*dlq_name).into()));
+
             channel
                 .queue_declare(
                     queue_name,
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
+                    QueueDeclareOptions { durable: true, ..Default::default() },
+                    args,
+                )
+                .await?;
+
+            channel
+                .queue_bind(queue_name, exchange_name, "", QueueBindOptions::default(), FieldTable::default())
+                .await?;
+
+            // DLQ: durable, dlq_exchange에 dlq_name 라우팅 키로 바인딩
+            channel
+                .queue_declare(
+                    dlq_name,
+                    QueueDeclareOptions { durable: true, ..Default::default() },
                     FieldTable::default(),
                 )
                 .await?;
 
-            // fanout exchange는 routing_key("")를 무시하므로 빈 문자열로 충분
             channel
-                .queue_bind(
-                    queue_name,
-                    exchange_name,
-                    "", // fanout에서 routing key는 무의미
-                    QueueBindOptions::default(),
-                    FieldTable::default(),
-                )
+                .queue_bind(dlq_name, dlq_exchange, dlq_name, QueueBindOptions::default(), FieldTable::default())
                 .await?;
+
+            tracing::info!(queue = %queue_name, dlq = %dlq_name, "큐 선언 완료 (DLX: {dlq_exchange})");
         }
 
         Ok(Self {

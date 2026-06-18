@@ -1,26 +1,23 @@
 /// TCP 리스너 — 카드 단말기로부터 실시간 결제 전문을 수신한다.
 ///
-/// 동작 방식:
-///   1. TcpListener::bind → 포트 38701 대기
-///   2. 연결마다 IP 화이트리스트 검사 (차단 시 즉시 drop)
-///   3. 전체/IP별 동시 연결 수 한도 검사 → 초과 시 거부
-///   4. 연결마다 tokio task 생성 → handle_connection
-///   5. 수신 바이트를 버퍼에 누적 → LLLL{payload} 프레임 단위로 추출
-///   6. 프레임 크기 검사 → 초과 시 버퍼 폐기
-///   7. parser::parse_frame → QueueMessage 변환
-///   8. DedupChecker → 중복 확인 → Producer::publish
+/// 요청-응답 흐름:
+///   단말기 → 전문 송신 → 서버 수신·처리 → 응답 송신 → 단말기 다음 전문
+///
+///   응답을 보내지 않으면 단말기가 타임아웃 후 재전송하므로, 신규/중복 모두 응답한다.
+///   msg_type: 0100(승인요청) → 0110(승인응답), 0200(취소요청) → 0210(취소응답)
+///   response_code: "00" (정상)
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::receiver::AppState;
 use crate::security::ConnectionTracker;
 use crate::telegram::Notifier;
 
-/// TCP 리스너를 시작한다.
 pub async fn start(
     addr: &str,
     allowed_ips: Vec<IpAddr>,
@@ -39,13 +36,11 @@ pub async fn start(
         let (stream, peer_addr) = listener.accept().await?;
         let peer_ip = peer_addr.ip();
 
-        // 화이트리스트 검사
         if !allowed_ips.is_empty() && !allowed_ips.contains(&peer_ip) {
             tracing::warn!(ip = %peer_ip, "허용되지 않은 IP — 연결 차단");
             continue;
         }
 
-        // 연결 수 한도 검사 — 초과 시 거부
         let guard = match tracker.acquire(peer_ip) {
             Ok(g) => g,
             Err(reason) => {
@@ -60,16 +55,26 @@ pub async fn start(
         let notifier = notifier.clone();
 
         tokio::spawn(async move {
-            let _guard = guard; // task 종료 시 자동으로 카운터 감소
+            let _guard = guard;
 
-            if let Err(e) = handle_connection(stream, state, max_frame_bytes).await {
-                tracing::error!(ip = %peer_ip, error = ?e, "TCP 연결 처리 오류");
-                if let Some(n) = &notifier {
-                    // 에러 원문 대신 종류만 전송 — 내부 정보 노출 방지
-                    n.notify(&format!(
-                        "🔴 <b>[TCP 리스너]</b> 연결 오류 (IP: {peer_ip})"
-                    ))
-                    .await;
+            match handle_connection(stream, state, max_frame_bytes).await {
+                Ok(()) => {}
+                Err(e) => {
+                    let kind = e.downcast_ref::<std::io::Error>().map(|e| e.kind());
+                    match kind {
+                        Some(ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted) => {
+                            tracing::warn!(ip = %peer_ip, "TCP 연결 강제 종료 (단말기 측)");
+                        }
+                        _ => {
+                            tracing::error!(ip = %peer_ip, error = ?e, "TCP 연결 처리 오류");
+                            if let Some(n) = &notifier {
+                                n.notify(&format!(
+                                    "🔴 <b>[TCP 리스너]</b> 연결 오류 (IP: {peer_ip}): {e}"
+                                ))
+                                .await;
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -78,62 +83,110 @@ pub async fn start(
 
 /// 개별 TCP 연결 처리.
 ///
-/// 소켓 읽기 루프와 프레임 처리를 분리한다:
-///   - 소켓 읽기 → 프레임 추출 → tokio::spawn (즉시 반환)
-///   - 처리(dedup + RabbitMQ)는 별도 태스크에서 병렬 실행
+/// 프레임 단위로 순차 처리 (수신 → 처리 → 응답 송신).
+/// 응답을 보내야 단말기가 재전송하지 않으므로 신규/중복 모두 응답한다.
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<AppState>,
     max_frame_bytes: usize,
 ) -> Result<()> {
-    // 동시 처리 중인 프레임 수를 제한 — 메모리 폭증 방지
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
-
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
+    let mut total_bytes: usize = 0;
+    let mut frame_count: usize = 0;
 
     loop {
-        // 30초 이상 데이터 없으면 idle 연결로 간주해 종료 (slow-loris 방어)
         let n = match tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
             stream.read(&mut tmp),
         )
         .await
         {
-            Ok(Ok(n)) => n,
+            Ok(Ok(n))  => n,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
-                tracing::warn!("TCP 연결 idle timeout (30초)");
+                tracing::warn!(total_bytes, frame_count, "TCP 연결 idle timeout (30초)");
                 return Ok(());
             }
         };
+
         if n == 0 {
-            tracing::info!("TCP 연결 종료 (EOF)");
+            if !buf.is_empty() {
+                tracing::warn!(
+                    pending_bytes = buf.len(),
+                    total_bytes,
+                    frame_count,
+                    "TCP EOF: 미처리 버퍼 데이터 폐기 (불완전 프레임)"
+                );
+            } else {
+                tracing::info!(total_bytes, frame_count, "TCP 연결 종료 (EOF)");
+            }
             return Ok(());
         }
+
+        total_bytes += n;
         buf.extend_from_slice(&tmp[..n]);
 
-        while let Some(frame) = extract_frame(&mut buf, max_frame_bytes) {
-            let state   = state.clone();
-            let permit  = semaphore.clone().acquire_owned().await?;
+        while let Some((frame, had_llll)) = extract_frame(&mut buf, max_frame_bytes) {
+            frame_count += 1;
 
-            tokio::spawn(async move {
-                process_frame(&frame, &state).await;
-                drop(permit);
-            });
+            let response = process_frame(&frame, &state).await;
+
+            // 신규/중복 모두 응답 — 보내지 않으면 단말기가 재전송
+            let resp_bytes = if had_llll {
+                let mut out = format!("{:04}", response.len()).into_bytes();
+                out.extend_from_slice(&response);
+                out
+            } else {
+                response
+            };
+
+            if let Err(e) = stream.write_all(&resp_bytes).await {
+                tracing::warn!(error = ?e, "TCP 응답 전송 실패");
+                return Err(e.into());
+            }
+        }
+
+        // 데이터는 받았는데 프레임이 아직 불완전한 경우
+        if buf.len() > 0 && frame_count == 0 {
+            tracing::debug!(buffered = buf.len(), received = n, "TCP 데이터 수신 — 프레임 미완성, 대기 중");
         }
     }
 }
 
-/// 파싱된 프레임을 dedup 체크 후 RabbitMQ에 발행한다.
-async fn process_frame(frame: &[u8], state: &AppState) {
+/// 프레임을 처리하고 단말기에 돌려줄 응답 바이트를 반환한다.
+///
+/// 신규: dedup 등록 → RabbitMQ 발행 → 응답
+/// 중복: 발행 없이 응답만 (단말기가 재전송하지 않도록)
+async fn process_frame(frame: &[u8], state: &AppState) -> Vec<u8> {
     let msg = match crate::parser::parse_frame(frame) {
-        Ok(m)  => m,
+        Ok(m) => m,
         Err(e) => {
-            tracing::error!(error = ?e, "TCP 프레임 파싱 실패");
-            return;
+            let preview: String = frame.iter().take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::error!(error = ?e, frame_len = frame.len(), preview, "TCP 프레임 파싱 실패");
+            return build_response(frame, "");
         }
     };
+
+    // 수신 데이터 로그
+    tracing::info!(
+        id            = %msg.id,
+        event_type    = %msg.event_type,
+        terminal_no   = %msg.payload["terminal_no"].as_str().unwrap_or(""),
+        merchant_no   = %msg.payload["merchant_no"].as_str().unwrap_or(""),
+        amount        = %msg.payload["amount"].as_str().unwrap_or(""),
+        response_code = %msg.payload["response_code"].as_str().unwrap_or(""),
+        cancel_flag   = %msg.payload["cancel_flag"].as_str().unwrap_or(""),
+        approval_no   = %msg.payload["approval_no"].as_str().unwrap_or(""),
+        approval_date = %msg.payload["approval_date"].as_str().unwrap_or(""),
+        approval_time = %msg.payload["approval_time"].as_str().unwrap_or(""),
+        "TCP 전문 수신"
+    );
+
+    let msg_type = msg.payload["msg_type"].as_str().unwrap_or("").to_string();
 
     match state.dedup.is_new(&msg.id).await {
         Ok(true) => {
@@ -144,46 +197,85 @@ async fn process_frame(frame: &[u8], state: &AppState) {
             }
         }
         Ok(false) => {
-            tracing::debug!(id = %msg.id, "중복 TCP 이벤트 무시");
+            tracing::info!(id = %msg.id, "중복 TCP 이벤트 — 응답만 송신");
         }
         Err(e) => {
-            // HTTP 경로와 동일하게: Redis 장애 시 dedup 없이 발행하지 않고 드롭
-            // 단말기는 응답 없음 → 재전송 → Redis 복구 후 처리
             tracing::warn!(error = ?e, id = %msg.id, "dedup 실패, 이벤트 드롭 (Redis 장애)");
         }
     }
+
+    build_response(frame, &msg_type)
 }
 
-/// 버퍼에서 LLLL{payload} 형식의 완전한 프레임 하나를 꺼낸다.
+/// 수신 프레임을 기반으로 응답 프레임을 생성한다.
 ///
-/// 프레임 크기가 `max_frame_bytes`를 초과하면 버퍼 전체를 폐기하고 None을 반환한다.
-fn extract_frame(buf: &mut Vec<u8>, max_frame_bytes: usize) -> Option<Vec<u8>> {
+/// - msg_type: 0100 → 0110, 0200 → 0210, 그 외 그대로
+/// - response_code(offset 24, len 2): "00" (정상)
+fn build_response(frame: &[u8], msg_type: &str) -> Vec<u8> {
+    let mut resp = frame.to_vec();
+
+    let resp_type = match msg_type {
+        "0100" => "0110",
+        "0200" => "0210",
+        other  => other,
+    };
+
+    // msg_type 교체 (offset 8, len 4)
+    if resp.len() >= 12 && !resp_type.is_empty() {
+        resp[8..12].copy_from_slice(resp_type.as_bytes());
+    }
+    // response_code "00" (offset 24, len 2)
+    if resp.len() >= 26 {
+        resp[24..26].copy_from_slice(b"00");
+    }
+
+    resp
+}
+
+const FIXED_FRAME_SIZE: usize = 170;
+
+/// 버퍼에서 완전한 페이로드 하나를 꺼낸다.
+///
+/// 반환: (payload, had_llll_header)
+///   had_llll_header = true  → LLLL{payload} 포맷이었음 → 응답에도 LLLL 헤더 필요
+///   had_llll_header = false → 고정 170바이트 포맷
+fn extract_frame(buf: &mut Vec<u8>, max_frame_bytes: usize) -> Option<(Vec<u8>, bool)> {
     if buf.len() < 4 {
         return None;
     }
 
-    let len_str = std::str::from_utf8(&buf[0..4]).ok()?;
-    let payload_len: usize = len_str.trim().parse().ok()?;
+    if buf[0..4].iter().all(|b| b.is_ascii_digit()) {
+        let len_str = std::str::from_utf8(&buf[0..4]).ok()?;
+        let payload_len: usize = len_str.trim().parse().ok()?;
 
-    // 빈 프레임 거부 — dedup 키 네임스페이스 오염 방지
-    if payload_len == 0 {
+        if payload_len == 0 {
+            buf.drain(..4);
+            return None;
+        }
+        if payload_len > max_frame_bytes {
+            tracing::warn!(payload_len, max_frame_bytes, "TCP 프레임 크기 초과 — 버퍼 폐기");
+            buf.clear();
+            return None;
+        }
+        let frame_end = 4 + payload_len;
+        if buf.len() < frame_end {
+            return None;
+        }
+        let payload = buf[4..frame_end].to_vec();
+        buf.drain(..frame_end);
+        return Some((payload, true));
+    }
+
+    // 고정 170바이트 포맷
+    if buf.len() < FIXED_FRAME_SIZE {
+        return None;
+    }
+    if FIXED_FRAME_SIZE > max_frame_bytes {
+        tracing::warn!(FIXED_FRAME_SIZE, max_frame_bytes, "TCP 고정 프레임 크기 초과 — 버퍼 폐기");
         buf.clear();
         return None;
     }
-
-    // 비정상적으로 큰 프레임 — 버퍼를 폐기하고 연결을 계속 유지
-    if payload_len > max_frame_bytes {
-        tracing::warn!(payload_len, max_frame_bytes, "TCP 프레임 크기 초과 — 버퍼 폐기");
-        buf.clear();
-        return None;
-    }
-
-    let frame_end = 4 + payload_len;
-    if buf.len() < frame_end {
-        return None;
-    }
-
-    let frame = buf[..frame_end].to_vec();
-    buf.drain(..frame_end);
-    Some(frame)
+    let payload = buf[..FIXED_FRAME_SIZE].to_vec();
+    buf.drain(..FIXED_FRAME_SIZE);
+    Some((payload, false))
 }

@@ -4,12 +4,16 @@
 /// 오류 발생 시 5초 후 자동 재시작한다.
 use anyhow::Result;
 use sqlx::mysql::MySqlPoolOptions;
+
+// Cargo.toml에 등록한 외부 크레이트
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+// 하이픈(-)이 언더스코어(_)로 바뀜, 여러개를 한번에 선언할 때
 use realtime_ingestion::{config::Config, consumer, logger, telegram};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 따로 저장하지 않고 OS 환경변수에 등록. std::env::var()형태로 사용
     let _ = dotenvy::from_path("/var/www/app/.env");
 
     // 파일 로그: /var/www/log/consumer-mysql/{년}/{월}/{일}/{시}.log

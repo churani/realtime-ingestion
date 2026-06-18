@@ -41,6 +41,11 @@ pub struct QueueMessage {
 
     /// 서버가 HTTP 요청을 수신한 시각 (unix ms)
     pub received_at: i64,
+
+    /// DB 테이블 라우팅 키 (사업자번호). kicc_b{table_key} 테이블에 저장.
+    /// TCP 카드 전문에서만 설정됨. None이면 폐기.
+    #[serde(default)]
+    pub table_key: Option<String>,
 }
 
 /// HTTP 응답에 사용하는 공통 JSON 바디

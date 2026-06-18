@@ -123,9 +123,9 @@ pub async fn handle_event(
         id: event.id.clone(),
         event_type: event.event_type,
         payload: event.payload,
-        // 클라이언트가 타임스탬프를 안 보냈으면 서버 수신 시각 사용
         timestamp: event.timestamp.unwrap_or(now_ms),
         received_at: now_ms,
+        table_key: None, // HTTP 경로는 카드 전문이 아니므로 테이블 라우팅 없음
     };
 
     // ── Step 3: RabbitMQ 발행 ─────────────────────────────────────────
